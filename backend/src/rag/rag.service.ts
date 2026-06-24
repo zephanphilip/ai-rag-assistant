@@ -6,6 +6,7 @@ import {
   HarmCategory,
   HarmBlockThreshold,
   Content,
+  EmbedContentRequest,
 } from '@google/generative-ai';
 import { PDFParse } from 'pdf-parse';
 import { Model } from 'mongoose';
@@ -36,10 +37,10 @@ export class RagService {
   ) {
     this.genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY as string);
     this.embedModel = this.genAI.getGenerativeModel({
-      model: 'text-embedding-004',
+      model: 'gemini-embedding-001',
     });
     this.chatModel = this.genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
+      model: 'gemini-2.5-flash',
     });
   }
 
@@ -232,7 +233,15 @@ ${context}`;
   }
 
   private async getEmbedding(text: string): Promise<number[]> {
-    const result = await this.embedModel.embedContent(text);
+    // Pin to 768 dims to match the Atlas `vector_index` configuration.
+    // The legacy SDK's EmbedContentRequest type omits `outputDimensionality`,
+    // but it forwards the request body verbatim, so the field still reaches
+    // the API at runtime — we extend the type to satisfy the compiler.
+    const request = {
+      content: { role: 'user', parts: [{ text }] },
+      outputDimensionality: 768,
+    } as EmbedContentRequest & { outputDimensionality: number };
+    const result = await this.embedModel.embedContent(request);
     return result.embedding.values;
   }
 
