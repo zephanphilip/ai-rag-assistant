@@ -27,7 +27,9 @@ const OUT_OF_SCOPE_MESSAGE =
 export class RagService {
   private readonly genAI: GoogleGenerativeAI;
   private readonly embedModel: GenerativeModel;
-  private readonly chatModel: GenerativeModel;
+  // Chat models tried in order; later entries are fallbacks used when an
+  // earlier (preferred) model is transiently overloaded.
+  private readonly chatModels: GenerativeModel[];
 
   constructor(
     @InjectModel(Chunk.name)
@@ -39,9 +41,9 @@ export class RagService {
     this.embedModel = this.genAI.getGenerativeModel({
       model: 'gemini-embedding-001',
     });
-    this.chatModel = this.genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-    });
+    this.chatModels = ['gemini-2.5-flash', 'gemini-2.0-flash'].map((model) =>
+      this.genAI.getGenerativeModel({ model }),
+    );
   }
 
   async ingestDocument(
@@ -174,37 +176,18 @@ Rules:
 Handbook context:
 ${context}`;
 
-    // 9. Start the chat with the grounding turn prepended to the history.
-    const chat = this.chatModel.startChat({
-      history: [
-        { role: 'user', parts: [{ text: systemContext }] },
-        {
-          role: 'model',
-          parts: [
-            { text: 'Understood. I will only answer from the handbook.' },
-          ],
-        },
-        ...history,
-      ],
-      generationConfig: {
-        maxOutputTokens: 1024,
-        temperature: 0.2,
+    // 9. Build the chat history with the grounding turn prepended.
+    const chatHistory: Content[] = [
+      { role: 'user', parts: [{ text: systemContext }] },
+      {
+        role: 'model',
+        parts: [{ text: 'Understood. I will only answer from the handbook.' }],
       },
-      safetySettings: [
-        {
-          category: HarmCategory.HARM_CATEGORY_HARASSMENT,
-          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        },
-        {
-          category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        },
-      ],
-    });
+      ...history,
+    ];
 
-    // 10. Send the question and extract the answer text.
-    const result = await chat.sendMessage(question);
-    const answer = result.response.text();
+    // 10. Generate the answer, falling back to a less-contended model on overload.
+    const answer = await this.generateAnswer(chatHistory, question);
 
     // 11. Persist the exchange.
     session.messages.push({
@@ -232,6 +215,74 @@ ${context}`;
     return { message: 'Session cleared' };
   }
 
+  /**
+   * Sends the chat request, retrying each model on transient overloads and
+   * falling back to the next configured model when one stays unavailable.
+   */
+  private async generateAnswer(
+    history: Content[],
+    question: string,
+  ): Promise<string> {
+    const generationConfig = { maxOutputTokens: 1024, temperature: 0.2 };
+    const safetySettings = [
+      {
+        category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+      },
+      {
+        category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+      },
+    ];
+
+    const maxRetriesPerModel = 2;
+    let lastError: unknown;
+
+    for (const model of this.chatModels) {
+      for (let attempt = 0; attempt <= maxRetriesPerModel; attempt++) {
+        try {
+          const chat = model.startChat({
+            history,
+            generationConfig,
+            safetySettings,
+          });
+          const result = await chat.sendMessage(question);
+          return result.response.text();
+        } catch (err) {
+          lastError = err;
+          // Only retry/fall back on transient overloads; surface real errors.
+          if (!this.isTransientError(err)) {
+            throw err;
+          }
+          if (attempt < maxRetriesPerModel) {
+            await this.delay(500 * (attempt + 1));
+          }
+        }
+      }
+      // This model stayed overloaded; the loop moves on to the next fallback.
+    }
+
+    throw lastError;
+  }
+
+  private isTransientError(err: unknown): boolean {
+    const status = (err as { status?: number })?.status;
+    if (status === 429 || status === 503) {
+      return true;
+    }
+    const message = (err as { message?: string })?.message?.toLowerCase() ?? '';
+    return (
+      message.includes('high demand') ||
+      message.includes('overloaded') ||
+      message.includes('503') ||
+      message.includes('429')
+    );
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   private async getEmbedding(text: string): Promise<number[]> {
     // Pin to 768 dims to match the Atlas `vector_index` configuration.
     // The legacy SDK's EmbedContentRequest type omits `outputDimensionality`,
@@ -241,8 +292,26 @@ ${context}`;
       content: { role: 'user', parts: [{ text }] },
       outputDimensionality: 768,
     } as EmbedContentRequest & { outputDimensionality: number };
-    const result = await this.embedModel.embedContent(request);
-    return result.embedding.values;
+
+    const maxRetries = 3;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await this.embedModel.embedContent(request);
+        return result.embedding.values;
+      } catch (err) {
+        lastError = err;
+        // Only retry transient overloads; surface real errors immediately.
+        if (!this.isTransientError(err) || attempt === maxRetries) {
+          throw err;
+        }
+        // Exponential backoff: 0.5s, 1s, 2s.
+        await this.delay(500 * 2 ** attempt);
+      }
+    }
+
+    throw lastError;
   }
 
   private splitIntoChunks(text: string, size = 500, overlap = 75): string[] {
