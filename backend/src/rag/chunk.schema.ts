@@ -11,11 +11,25 @@ export class Chunk {
   @Prop({ required: true })
   source: string;
 
+  // Links every chunk to a specific uploaded document.
+  @Prop({ required: true })
+  documentId: string;
+
+  @Prop({ required: true })
+  documentName: string;
+
   @Prop({ required: true })
   chunkIndex: number;
 
   @Prop({ type: [Number], required: true })
   embedding: number[];
+
+  // The handbook section this chunk belongs to (for retrieval context).
+  @Prop()
+  sectionTitle?: string;
+
+  @Prop()
+  wordCount?: number;
 }
 
 export const ChunkSchema = SchemaFactory.createForClass(Chunk);

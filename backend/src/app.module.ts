@@ -4,6 +4,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { RagModule } from './rag/rag.module';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { RagModule } from './rag/rag.module';
         uri: config.get<string>('MONGODB_URI'),
       }),
     }),
+    AuthModule,
     RagModule,
   ],
   controllers: [AppController],
